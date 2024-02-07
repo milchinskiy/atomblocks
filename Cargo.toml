@@ -1,0 +1,30 @@
+[package]
+name = "atomblocks"
+version = "0.1.0"
+edition = "2021"
+license-file = "LICENSE"
+description = "async, absolutely lightweight and dead simple bar for dwm and similar window managers"
+readme = "README.md"
+homepage = "https://github.com/milchinskiy/atomblocks"
+repository = "https://github.com/milchinskiy/atomblocks"
+keywords = ["utils", "bar", "x11"]
+categories = ["command-line-utilities", "os"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+simple_logger = { version = "4", features = [
+  "colored",
+], default-features = false }
+log = { version = "0.4", default-features = false }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", default-features = false }
+x11rb = { version = "0.13" }
+argh = { version = "0.1" }
+
+[profile.release]
+opt-level = "z"
+strip = "symbols"
+lto = "fat"
+panic = "abort"
+codegen-units = 1

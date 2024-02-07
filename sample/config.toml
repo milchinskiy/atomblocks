@@ -1,0 +1,41 @@
+# example configuration file (2024-02-09)
+#
+# Each block has several parameters:
+# `execute` -   console command or file or script that will be called at the interval.
+# `interval`-   The interval in seconds at which the specified command will be run.
+#
+# if the interval is zero, the script will not be launched even once.
+# In this case, the only option is to manually update it via
+# `atomblocks hit <ID>` which triggers the command to make an update
+#
+# I strongly DO NOT recommend to use too short an interval for
+# time-consuming scripts. The consequences may be unpredictable.
+#
+
+
+# (optional) delimiter between blocks in bar
+delimiter = " | "
+
+[[block]]
+# this will be executed as /bin/sh -c <your script>
+execute = "date +%s"
+# (optional) interval in seconds; can be float
+# usually it should not be less than 0.2-0.3, but no errors will appear, up to you
+interval = 1
+# (optional ) print before command result
+before = "date: "
+# (optional) print after command result
+after = ""
+
+# another block example
+[[block]]
+execute = "echo 'Hello, World!'"
+interval = 600
+
+# and again
+[[block]]
+execute = "xkblayout-state print '%s'"
+# this will be updated only manually, using
+# `atomblocks hit 2`
+# where 2 - block index
+interval = 0
