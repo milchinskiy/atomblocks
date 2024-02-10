@@ -57,8 +57,11 @@ cargo install atomblocks
 
 ### Install from AUR (Arch Linux)
 
-_work in progress..._
+using `yay`, `paru` or any other AUR helper you prefer, yay for example:
 
+```sh
+yay -S atomblocks
+```
 
 ### Install via Nix Flakes
 
@@ -111,7 +114,7 @@ atomblocks run --config ./my-custom-config.toml
 
 - [ ] Delivery methods
     - [ ] Nix Flakes
-    - [ ] AUR
+    - [x] AUR
     - [x] crates.io
 
 
