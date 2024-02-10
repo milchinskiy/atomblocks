@@ -63,10 +63,11 @@ using `yay`, `paru` or any other AUR helper you prefer, yay for example:
 yay -S atomblocks
 ```
 
-### Install via Nix Flakes
+### Run via Nix Flakes
 
-_work in progress..._
-
+```sh
+nix run github:milchinskiy/atomblocks -- run --config <your.config.toml>
+```
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -103,22 +104,7 @@ atomblocks hit <ID>
 atomblocks run --config ./my-custom-config.toml
 ```
 
-
-
-
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
-
-
-
-### TODO
-
-- [ ] Delivery methods
-    - [ ] Nix Flakes
-    - [x] AUR
-    - [x] crates.io
-
-
-
 
 <!-- CONTRIBUTING -->
 ## Contributing

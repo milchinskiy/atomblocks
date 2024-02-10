@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// and dead simple bar for dwm and similar window managers
 pub struct AtomBlocksCli {
     #[argh(subcommand)]
-    action: CliActions,
+    action: Option<CliActions>,
 
     /// set log level to INFO
     #[argh(switch, short = 'v', long = "verbose")]
@@ -15,6 +15,10 @@ pub struct AtomBlocksCli {
     /// set log level to TRACE (a lot of records, be careful)
     #[argh(switch, long = "trace")]
     trace: bool,
+
+    /// version
+    #[argh(switch, long = "version")]
+    version: bool,
 }
 
 impl AtomBlocksCli {
@@ -24,8 +28,11 @@ impl AtomBlocksCli {
     pub fn trace(&self) -> bool {
         self.trace
     }
-    pub fn action(&self) -> &CliActions {
-        &self.action
+    pub fn action(&self) -> Option<&CliActions> {
+        self.action.as_ref()
+    }
+    pub fn version(&self) -> bool {
+        self.version
     }
 }
 

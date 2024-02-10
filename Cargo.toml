@@ -1,6 +1,6 @@
 [package]
 name = "atomblocks"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license-file = "LICENSE"
 description = "async, absolutely lightweight and dead simple bar for dwm and similar window managers"
@@ -9,8 +9,6 @@ homepage = "https://github.com/milchinskiy/atomblocks"
 repository = "https://github.com/milchinskiy/atomblocks"
 keywords = ["utils", "bar", "x11"]
 categories = ["command-line-utilities", "os"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 simple_logger = { version = "4", features = [

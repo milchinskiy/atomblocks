@@ -24,8 +24,13 @@ fn main() {
     logger.with_colors(true).init().unwrap();
     log::debug!("logger initialized");
 
+    if cli.version() {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     let result = match cli.action() {
-        CliActions::Run(params) => {
+        Some(CliActions::Run(params)) => {
             let config_file = if let Some(path) = params.config() {
                 Ok(path)
             } else {
@@ -38,7 +43,11 @@ fn main() {
                 Err(AtomBlocksError::Config("Failed to load config".into()))
             }
         }
-        CliActions::Hit(params) => hit(params.id()),
+        Some(CliActions::Hit(params)) => hit(params.id()),
+        None => {
+            println!("Missing command");
+            Ok(())
+        }
     };
 
     match result {
