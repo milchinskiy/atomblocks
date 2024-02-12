@@ -5,6 +5,6 @@ atom_manager! {
     pub AtomBlocksAtoms:
     /// A handle to a response from the X11 server.
     AtomBlocksAtomsCookie {
-        _AB_QUEUE,
+        _ATOMBLOCKS_HIT_QUEUE,
     }
 }

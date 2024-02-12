@@ -1,13 +1,15 @@
 use config::Config;
 use std::{
-    ops::Add,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use x11rb::{
     connection::Connection,
     protocol::{
-        xproto::{AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, PropMode},
+        xproto::{
+            AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, PropMode, Property,
+        },
         Event,
     },
     wrapper::ConnectionExt as _,
@@ -19,8 +21,6 @@ pub mod config;
 pub mod error;
 pub mod helpers;
 pub mod types;
-
-const LOOP_PRECISION_MS: u64 = 10;
 
 pub struct HitMan {
     xconn: x11rb::rust_connection::RustConnection,
@@ -38,7 +38,7 @@ impl HitMan {
             .change_property32(
                 PropMode::APPEND,
                 self.root,
-                self.atoms._AB_QUEUE,
+                self.atoms._ATOMBLOCKS_HIT_QUEUE,
                 AtomEnum::INTEGER,
                 &[id],
             )?
@@ -49,7 +49,7 @@ impl HitMan {
 pub struct AtomBlocks {
     config: Config,
     cells: Vec<String>,
-    xconn: x11rb::rust_connection::RustConnection,
+    xconn: Arc<x11rb::rust_connection::RustConnection>,
     root: u32,
     atoms: atoms::AtomBlocksAtoms,
 }
@@ -62,124 +62,144 @@ impl AtomBlocks {
             &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
         )?;
 
+        xconn
+            .change_window_attributes(
+                root,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            )
+            .expect("ChangeWindowAttributesAux");
+
         let capacity = config.block.len();
         let cells = vec![String::new(); capacity];
         log::trace!("Allocated {} cells ({})", capacity, cells.len());
         Ok(Self {
             config,
             cells,
-            xconn,
+            xconn: Arc::new(xconn),
             root,
             atoms,
         })
     }
 
     pub fn run(&mut self) -> types::Result<()> {
-        let mut tasks = self
-            .config
-            .block
-            .iter()
-            .enumerate()
-            .map(|(index, b)| {
-                let interval = Duration::from_secs_f32(b.interval.unwrap_or_default());
-                Task {
-                    index,
-                    interval,
-                    last_run: Instant::now() - interval,
-                    execute: b.execute.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut last_run = Instant::now();
-        loop {
-            if last_run.elapsed() < Duration::from_millis(LOOP_PRECISION_MS) {
-                std::thread::sleep(Duration::from_millis(LOOP_PRECISION_MS));
-            }
-            let hit_request_blocks: Vec<usize> =
-                if let Ok(Some(Event::PropertyNotify(event))) = self.xconn.poll_for_event() {
-                    log::debug!("{}: Received event: {:?}", event.window, event);
-                    if event.atom != self.atoms._AB_QUEUE || event.window != self.root {
-                        continue;
-                    };
-                    let Ok(Ok(reply)) = self
-                        .xconn
-                        .get_property(
-                            true,
-                            self.root,
-                            self.atoms._AB_QUEUE,
-                            AtomEnum::INTEGER,
-                            0,
-                            1024,
-                        )
-                        .map(|v| v.reply())
-                    else {
-                        log::debug!("Failed to get property: {:?}", event);
-                        continue;
-                    };
-                    let Some(values) = reply.value32() else {
-                        log::debug!("Failed to get values: {:?}", event);
-                        continue;
-                    };
-
-                    let mut hit_request_blocks = values.map(|v| v as usize).collect::<Vec<usize>>();
-                    hit_request_blocks.dedup();
-                    log::debug!("Hit request blocks: {:?}", hit_request_blocks);
-                    hit_request_blocks
-                } else {
-                    Vec::new()
-                };
-
-            let pending_tasks = tasks
-                .iter_mut()
-                .filter(|b| {
-                    if hit_request_blocks.contains(&b.index) {
-                        log::debug!("{}: Hit request to block update", b.index);
-                        return true;
-                    }
-                    if b.interval > Duration::from_secs(0)
-                        && b.last_run.add(b.interval) <= Instant::now()
-                    {
-                        return true;
-                    }
-                    false
-                })
-                .map(|task| {
-                    log::info!("#{}: processing a request to block update", task.index);
-                    task.last_run = Instant::now();
-                    (
-                        task.index,
-                        Command::new("/bin/sh")
-                            .arg("-c")
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .arg(&task.execute)
-                            .spawn(),
-                    )
-                })
-                .filter(|(_, cmd)| cmd.is_ok())
-                .map(|(index, cmd)| (index, cmd.unwrap()))
-                .collect::<Vec<_>>();
-
-            let mut new_cells = self.cells.clone();
-            for (index, pt) in pending_tasks {
-                let Ok(output) = pt.wait_with_output() else {
+        let (sender, receiver) = std::sync::mpsc::channel::<Vec<usize>>();
+        let sender = Arc::new(sender);
+        let xconn = self.xconn.clone();
+        let x11_atom = self.atoms._ATOMBLOCKS_HIT_QUEUE;
+        let root = self.root;
+        let x11_sender = sender.clone();
+        std::thread::spawn(move || loop {
+            while let Ok(Event::PropertyNotify(event)) = xconn.wait_for_event() {
+                if event.atom != x11_atom || event.window != root || event.state == Property::DELETE
+                {
                     continue;
                 };
+
+                let Ok(Ok(reply)) = xconn
+                    .get_property(true, root, x11_atom, AtomEnum::INTEGER, 0, 1024)
+                    .map(|v| v.reply())
+                else {
+                    log::warn!("Failed to get property reply: {:?}", event.state);
+                    continue;
+                };
+
+                let Some(values) = reply.value32() else {
+                    log::warn!("Failed to get reply values, continue");
+                    continue;
+                };
+
+                log::info!("Received X11 PropertyNotify");
+                let mut hit_request_blocks = values.map(|v| v as usize).collect::<Vec<usize>>();
+                hit_request_blocks.dedup();
+                hit_request_blocks.iter().for_each(|index| {
+                    x11_sender
+                        .send(vec![*index])
+                        .map_err(|err| {
+                            log::error!("send error: {:?}", err);
+                        })
+                        .ok();
+                });
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        let mut tasks: Vec<Task> = self
+            .config
+            .block
+            .clone()
+            .iter()
+            .map(|block| Task {
+                block: block.clone(),
+                last_run: Instant::now()
+                    - Duration::from_secs_f32(block.interval.unwrap_or_default()),
+            })
+            .collect();
+
+        let x11_sender = sender.clone();
+        std::thread::spawn(move || loop {
+            let mut indexes = Vec::new();
+            for (index, task) in tasks.iter_mut().enumerate() {
+                let Some(interval) = task.block.interval else {
+                    continue;
+                };
+                if (task.last_run + Duration::from_secs_f32(interval)) > Instant::now() {
+                    continue;
+                }
+                task.last_run = Instant::now();
+                indexes.push(index);
+            }
+
+            if !indexes.is_empty() {
+                x11_sender
+                    .send(indexes)
+                    .map_err(|err| {
+                        log::error!("send error: {:?}", err);
+                    })
+                    .ok();
+            }
+
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        log::info!("Ready to receive events");
+        while let Ok(indexes) = receiver.recv() {
+            let mut new_cells = self.cells.clone();
+            let mut spawns: Vec<(usize, Child)> = Vec::new();
+
+            for index in indexes {
+                if let Some(block) = self.config.block.get(index) {
+                    log::debug!("Run: {}", block.execute.as_str());
+
+                    if let Ok(output) = Command::new("sh")
+                        .arg("-c")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .arg(block.execute.as_str())
+                        .spawn()
+                    {
+                        spawns.push((index, output));
+                    }
+                }
+            }
+
+            for (index, child) in spawns {
                 let Some(block) = self.config.block.get(index) else {
                     continue;
                 };
-                log::debug!("#{}: Executed command: {}", index, block.execute);
+                let Ok(output) = child.wait_with_output() else {
+                    continue;
+                };
                 new_cells[index] =
                     block.print(String::from_utf8_lossy(output.stdout.as_slice()).to_string());
             }
 
-            last_run = Instant::now();
             if new_cells != self.cells {
                 self.cells = new_cells;
                 self.print();
             }
         }
+
+        Ok(())
     }
 
     fn print(&self) {
@@ -208,8 +228,6 @@ impl AtomBlocks {
 }
 
 pub struct Task {
-    index: usize,
-    interval: Duration,
+    block: config::Block,
     last_run: Instant,
-    execute: String,
 }
