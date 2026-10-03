@@ -6,7 +6,7 @@ use atomblocks::{
     AtomBlocks, OutputMode,
 };
 use simple_logger::SimpleLogger;
-use std::{io::ErrorKind, path::PathBuf, process::ExitCode};
+use std::{ffi::OsString, io::ErrorKind, path::PathBuf, process::ExitCode};
 
 const CONFIG_FILE: &str = "config.toml";
 
@@ -31,22 +31,17 @@ fn main() -> ExitCode {
 
     let result = match cli.action() {
         Some(CliActions::Run(params)) => {
-            let config_file = if let Some(path) = params.config() {
-                Ok(path)
+            let config_file = match params.config() {
+                Some(path) => Ok(path),
+                None => get_config_path(),
+            };
+            let output = if params.stdout() {
+                OutputMode::Stdout
             } else {
-                get_config_path()
+                OutputMode::X11
             };
             log::info!("Starting AtomBlocks");
-            if let Ok(config_file) = config_file {
-                let output = if params.stdout() {
-                    OutputMode::Stdout
-                } else {
-                    OutputMode::X11
-                };
-                run(config_file, output)
-            } else {
-                Err(AtomBlocksError::Config("Failed to load config".into()))
-            }
+            config_file.and_then(|path| run(path, output))
         }
         Some(CliActions::Hit(params)) => hit(params.id()),
         None => {
@@ -57,11 +52,14 @@ fn main() -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(AtomBlocksError::IOError(err)) if err.kind() == ErrorKind::BrokenPipe => {
+        Err(AtomBlocksError::IOError(error)) if error.kind() == ErrorKind::BrokenPipe => {
             ExitCode::SUCCESS
         }
-        Err(err) => {
-            log::error!("{}", err);
+        Err(AtomBlocksError::Interrupted(signal)) => {
+            ExitCode::from((128_i32.saturating_add(signal)).clamp(1, 255) as u8)
+        }
+        Err(error) => {
+            log::error!("{error}");
             ExitCode::FAILURE
         }
     }
@@ -69,8 +67,9 @@ fn main() -> ExitCode {
 
 fn run(config: PathBuf, output: OutputMode) -> atomblocks::types::Result<()> {
     log::debug!("Starting AtomBlocks");
-    Config::load_from_file(config)
-        .and_then(|config| AtomBlocks::new_with_output(config, output).and_then(|mut a| a.run()))
+    Config::load_from_file(config).and_then(|config| {
+        AtomBlocks::new_with_output(config, output).and_then(|mut bar| bar.run())
+    })
 }
 
 fn hit(id: u32) -> atomblocks::types::Result<()> {
@@ -79,22 +78,81 @@ fn hit(id: u32) -> atomblocks::types::Result<()> {
 }
 
 fn get_config_path() -> Result<PathBuf> {
-    let mut path: PathBuf;
-    if let Some(home_config_dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        path = PathBuf::from(home_config_dir);
-        path.push("atomblocks");
-    } else if let Some(home_dir) = std::env::var_os("HOME") {
-        path = PathBuf::from(home_dir);
-        path.push(".config/atomblocks");
-    } else {
-        path = PathBuf::from("/etc/atomblocks");
+    let candidates = config_candidates(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    );
+    for path in &candidates {
+        match std::fs::metadata(path) {
+            Ok(_) => return Ok(path.clone()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Ok(path.clone()),
+        }
     }
-    path.push(CONFIG_FILE);
 
-    if !path.exists() {
-        return Err(AtomBlocksError::Config(
-            "Config file not specified or not found".to_owned(),
-        ));
+    Err(AtomBlocksError::Config(format!(
+        "config file not found; tried {}",
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+fn config_candidates(xdg_config_home: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(3);
+
+    if let Some(value) = xdg_config_home.filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            candidates.push(path.join("atomblocks").join(CONFIG_FILE));
+        } else {
+            log::warn!("ignoring relative XDG_CONFIG_HOME: {}", path.display());
+        }
     }
-    Ok(path)
+
+    if let Some(value) = home.filter(|value| !value.is_empty()) {
+        candidates.push(
+            PathBuf::from(value)
+                .join(".config")
+                .join("atomblocks")
+                .join(CONFIG_FILE),
+        );
+    }
+    candidates.push(PathBuf::from("/etc/atomblocks").join(CONFIG_FILE));
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_discovery_keeps_precedence_and_fallbacks() {
+        let candidates = config_candidates(
+            Some(OsString::from("/xdg")),
+            Some(OsString::from("/home/test")),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/xdg/atomblocks/config.toml"),
+                PathBuf::from("/home/test/.config/atomblocks/config.toml"),
+                PathBuf::from("/etc/atomblocks/config.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_or_relative_xdg_paths_are_ignored() {
+        assert_eq!(
+            config_candidates(Some(OsString::new()), None),
+            vec![PathBuf::from("/etc/atomblocks/config.toml")]
+        );
+        assert_eq!(
+            config_candidates(Some(OsString::from("relative")), None),
+            vec![PathBuf::from("/etc/atomblocks/config.toml")]
+        );
+    }
 }

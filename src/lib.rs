@@ -1,18 +1,14 @@
-use config::Config;
+use config::{Config, PreparedConfig};
 use std::{
-    io::{self, Write},
-    process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use x11rb::{
-    connection::Connection,
-    protocol::{
-        xproto::{
-            AtomEnum, ChangeWindowAttributesAux, ConnectionExt, EventMask, PropMode, Property,
-        },
-        Event,
-    },
+    protocol::xproto::{AtomEnum, PropMode},
     wrapper::ConnectionExt as _,
 };
 
@@ -20,22 +16,28 @@ pub mod atoms;
 pub mod cli;
 pub mod config;
 pub mod error;
-pub mod helpers;
+mod output;
+mod runner;
+mod scheduler;
 pub mod types;
+mod x11;
+
+const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct HitMan {
     xconn: x11rb::rust_connection::RustConnection,
     root: u32,
     atoms: atoms::AtomBlocksAtoms,
 }
+
 impl HitMan {
     pub fn new() -> types::Result<Self> {
-        let (xconn, root, atoms) = helpers::x11_connect()?;
+        let (xconn, root, atoms) = x11::x11_connect()?;
         Ok(Self { xconn, root, atoms })
     }
+
     pub fn hit_block(&self, id: u32) -> types::Result<()> {
-        Ok(self
-            .xconn
+        self.xconn
             .change_property32(
                 PropMode::APPEND,
                 self.root,
@@ -43,7 +45,8 @@ impl HitMan {
                 AtomEnum::INTEGER,
                 &[id],
             )?
-            .check()?)
+            .check()?;
+        Ok(())
     }
 }
 
@@ -55,12 +58,17 @@ pub enum OutputMode {
 }
 
 pub struct AtomBlocks {
-    config: Config,
+    config: PreparedConfig,
     output: OutputMode,
     cells: Vec<String>,
-    xconn: Arc<x11rb::rust_connection::RustConnection>,
-    root: u32,
-    atoms: atoms::AtomBlocksAtoms,
+    x11: x11::Backend,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeEvent {
+    Runner(runner::RunResult),
+    HitsReady,
+    Fatal(error::AtomBlocksError),
 }
 
 impl AtomBlocks {
@@ -70,183 +78,158 @@ impl AtomBlocks {
 
     /// Select the bar output destination; an X11 connection is still required.
     pub fn new_with_output(config: Config, output: OutputMode) -> types::Result<Self> {
-        let (xconn, root, atoms) = helpers::x11_connect()?;
-        xconn.change_window_attributes(
-            root,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-        )?;
-
-        xconn
-            .change_window_attributes(
-                root,
-                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
-            )
-            .expect("ChangeWindowAttributesAux");
-        // Subscribe before waiting for hits, even when no WM_NAME write follows.
-        xconn.flush()?;
-
-        let capacity = config.block.len();
-        let cells = vec![String::new(); capacity];
-        log::trace!("Allocated {} cells ({})", capacity, cells.len());
+        // Validate all runtime values before opening X11 or starting any worker.
+        let config = config.prepare()?;
+        let x11 = x11::Backend::connect()?;
+        let cells = vec![String::new(); config.blocks.len()];
+        log::trace!("Allocated {} cells", cells.len());
         Ok(Self {
             config,
             output,
             cells,
-            xconn: Arc::new(xconn),
-            root,
-            atoms,
+            x11,
         })
     }
 
     pub fn run(&mut self) -> types::Result<()> {
-        let (sender, receiver) = std::sync::mpsc::channel::<Vec<usize>>();
-        let sender = Arc::new(sender);
-        let xconn = self.xconn.clone();
-        let x11_atom = self.atoms._ATOMBLOCKS_HIT_QUEUE;
-        let root = self.root;
-        let x11_sender = sender.clone();
-        std::thread::spawn(move || loop {
-            while let Ok(Event::PropertyNotify(event)) = xconn.wait_for_event() {
-                if event.atom != x11_atom || event.window != root || event.state == Property::DELETE
-                {
-                    continue;
-                };
+        let _signals = SignalGuard::install()?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (events, receiver) = mpsc::channel::<RuntimeEvent>();
+        let hits = Arc::new(x11::HitInbox::new(self.config.blocks.len()));
 
-                let Ok(Ok(reply)) = xconn
-                    .get_property(true, root, x11_atom, AtomEnum::INTEGER, 0, 1024)
-                    .map(|v| v.reply())
-                else {
-                    log::warn!("Failed to get property reply: {:?}", event.state);
-                    continue;
-                };
-
-                let Some(values) = reply.value32() else {
-                    log::warn!("Failed to get reply values, continue");
-                    continue;
-                };
-
-                log::info!("Received X11 PropertyNotify");
-                let mut hit_request_blocks = values.map(|v| v as usize).collect::<Vec<usize>>();
-                hit_request_blocks.dedup();
-                hit_request_blocks.iter().for_each(|index| {
-                    x11_sender
-                        .send(vec![*index])
-                        .map_err(|err| {
-                            log::error!("send error: {:?}", err);
-                        })
-                        .ok();
-                });
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        });
-
-        let mut tasks: Vec<Task> = self
-            .config
-            .block
-            .clone()
-            .iter()
-            .map(|block| Task {
-                block: block.clone(),
-                last_run: Instant::now()
-                    - Duration::from_secs_f32(block.interval.unwrap_or_default()),
-            })
-            .collect();
-
-        let x11_sender = sender.clone();
-        std::thread::spawn(move || loop {
-            let mut indexes = Vec::new();
-            for (index, task) in tasks.iter_mut().enumerate() {
-                let Some(interval) = task.block.interval else {
-                    continue;
-                };
-                if (task.last_run + Duration::from_secs_f32(interval)) > Instant::now() {
-                    continue;
+        self.x11
+            .start(hits.clone(), events.clone(), shutdown.clone())?;
+        let mut output =
+            match output::OutputController::start(self.output, events.clone(), shutdown.clone()) {
+                Ok(output) => output,
+                Err(error) => {
+                    shutdown.store(true, Ordering::Release);
+                    self.x11.shutdown();
+                    return Err(error);
                 }
-                task.last_run = Instant::now();
-                indexes.push(index);
-            }
+            };
+        let mut runners =
+            runner::RunnerPool::new(self.config.blocks.len(), events.clone(), shutdown.clone());
+        drop(events);
 
-            if !indexes.is_empty() {
-                x11_sender
-                    .send(indexes)
-                    .map_err(|err| {
-                        log::error!("send error: {:?}", err);
-                    })
-                    .ok();
-            }
-
-            std::thread::sleep(Duration::from_millis(100));
-        });
+        let now = Instant::now();
+        let mut scheduler =
+            scheduler::Scheduler::new(self.config.blocks.iter().map(|block| block.interval), now);
+        let mut last_diagnostics = vec![None::<String>; self.config.blocks.len()];
 
         log::info!("Ready to receive events");
-        while let Ok(indexes) = receiver.recv() {
-            let mut new_cells = self.cells.clone();
-            let mut spawns: Vec<(usize, Child)> = Vec::new();
+        let result = self.run_loop(
+            &receiver,
+            &hits,
+            &mut scheduler,
+            &mut runners,
+            &output,
+            &mut last_diagnostics,
+        );
 
-            for index in indexes {
-                if let Some(block) = self.config.block.get(index) {
-                    log::debug!("Run: {}", block.execute.as_str());
-
-                    if let Ok(output) = Command::new("sh")
-                        .arg("-c")
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .arg(block.execute.as_str())
-                        .spawn()
-                    {
-                        spawns.push((index, output));
-                    }
-                }
-            }
-
-            for (index, child) in spawns {
-                let Some(block) = self.config.block.get(index) else {
-                    continue;
-                };
-                let Ok(output) = child.wait_with_output() else {
-                    continue;
-                };
-                new_cells[index] =
-                    block.print(String::from_utf8_lossy(output.stdout.as_slice()).to_string());
-            }
-
-            if new_cells != self.cells {
-                self.cells = new_cells;
-                self.print()?;
-            }
-        }
-
-        Ok(())
+        shutdown.store(true, Ordering::Release);
+        self.x11.shutdown();
+        runners.shutdown_and_join();
+        output.shutdown();
+        result
     }
 
-    fn print(&self) -> types::Result<()> {
-        let result = render_bar(
-            &self.cells,
-            self.config.delimiter.as_deref().unwrap_or_default(),
-        );
-        if self.output == OutputMode::Stdout {
-            write_stdout_record(&mut io::stdout().lock(), &result)?;
-            return Ok(());
-        }
+    fn run_loop(
+        &mut self,
+        receiver: &mpsc::Receiver<RuntimeEvent>,
+        hits: &x11::HitInbox,
+        scheduler: &mut scheduler::Scheduler,
+        runners: &mut runner::RunnerPool,
+        output: &output::OutputController,
+        last_diagnostics: &mut [Option<String>],
+    ) -> types::Result<()> {
+        loop {
+            if let Some(signal) = received_signal() {
+                return Err(error::AtomBlocksError::Interrupted(signal));
+            }
 
-        log::info!("Updating WM_NAME property...");
-        if let Err(err) = self
-            .xconn
-            .change_property8(
-                PropMode::REPLACE,
-                self.root,
-                AtomEnum::WM_NAME,
-                AtomEnum::STRING,
-                result.as_bytes(),
-            )
-            .map(|r| r.check())
-        {
-            log::error!("Failed to set WM_NAME property: {}", err);
+            for index in scheduler.due(Instant::now()) {
+                runners.start(index, self.config.blocks[index].clone())?;
+            }
+
+            let wait = scheduler
+                .next_deadline()
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(SIGNAL_POLL_INTERVAL)
+                .min(SIGNAL_POLL_INTERVAL);
+
+            match receiver.recv_timeout(wait) {
+                Ok(RuntimeEvent::Runner(result)) => {
+                    let index = result.index();
+                    runners.finish(index)?;
+                    self.apply_run_result(result, output, last_diagnostics);
+                    if let Some(index) = scheduler.complete(index) {
+                        runners.start(index, self.config.blocks[index].clone())?;
+                    }
+                }
+                Ok(RuntimeEvent::HitsReady) => {
+                    for index in hits.take() {
+                        if let Some(index) = scheduler.hit(index) {
+                            runners.start(index, self.config.blocks[index].clone())?;
+                        }
+                    }
+                }
+                Ok(RuntimeEvent::Fatal(error)) => return Err(error),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(error::AtomBlocksError::Runtime(
+                        "runtime event channel disconnected".into(),
+                    ));
+                }
+            }
         }
-        Ok(())
+    }
+
+    fn apply_run_result(
+        &mut self,
+        result: runner::RunResult,
+        output: &output::OutputController,
+        last_diagnostics: &mut [Option<String>],
+    ) {
+        match result {
+            runner::RunResult::Completed {
+                index,
+                rendered,
+                diagnostic,
+            } => {
+                report_diagnostic(index, diagnostic.as_deref(), last_diagnostics);
+                if self.cells[index] != rendered {
+                    self.cells[index] = rendered;
+                    output.publish(render_bar(
+                        &self.cells,
+                        self.config.delimiter.as_deref().unwrap_or_default(),
+                    ));
+                }
+            }
+            runner::RunResult::Failed { index, diagnostic } => {
+                report_diagnostic(index, Some(&diagnostic), last_diagnostics);
+            }
+        }
     }
 }
 
+fn report_diagnostic(index: usize, diagnostic: Option<&str>, previous: &mut [Option<String>]) {
+    let Some(slot) = previous.get_mut(index) else {
+        return;
+    };
+    match diagnostic {
+        Some(message) if slot.as_deref() != Some(message) => {
+            log::error!("{message}");
+            *slot = Some(message.to_owned());
+        }
+        Some(_) => {}
+        None => *slot = None,
+    }
+}
+
+/// NOTE: kept for source compatibility with 0.2.x; scheduling is now internal
+#[doc(hidden)]
+#[allow(dead_code)]
 pub struct Task {
     block: config::Block,
     last_run: Instant,
@@ -261,10 +244,54 @@ fn render_bar(cells: &[String], delimiter: &str) -> String {
         .join(delimiter)
 }
 
-fn write_stdout_record(writer: &mut impl Write, bar: &str) -> io::Result<()> {
-    // A bar update is one line, even when commands or decorations contain CR/LF.
-    writeln!(writer, "{}", bar.replace(['\r', '\n'], ""))?;
-    writer.flush()
+static RECEIVED_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn signal_handler(signal: i32) {
+    RECEIVED_SIGNAL.store(signal, Ordering::Relaxed);
+}
+
+fn received_signal() -> Option<i32> {
+    match RECEIVED_SIGNAL.load(Ordering::Relaxed) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+struct SignalGuard {
+    previous_int: libc::sighandler_t,
+    previous_term: libc::sighandler_t,
+}
+
+impl SignalGuard {
+    fn install() -> types::Result<Self> {
+        RECEIVED_SIGNAL.store(0, Ordering::Relaxed);
+        let handler = signal_handler as *const () as libc::sighandler_t;
+        let previous_int = unsafe { libc::signal(libc::SIGINT, handler) };
+        if previous_int == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let previous_term = unsafe { libc::signal(libc::SIGTERM, handler) };
+        if previous_term == libc::SIG_ERR {
+            unsafe {
+                libc::signal(libc::SIGINT, previous_int);
+            }
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self {
+            previous_int,
+            previous_term,
+        })
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous_int);
+            libc::signal(libc::SIGTERM, self.previous_term);
+        }
+        RECEIVED_SIGNAL.store(0, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -278,65 +305,5 @@ mod tests {
         assert_eq!(render_bar(&cells, ""), "[α\n] β ");
         assert_eq!(render_bar(&[], " | "), "");
         assert_eq!(render_bar(&[String::new()], " | "), "");
-    }
-
-    #[derive(Default)]
-    struct Writer {
-        bytes: Vec<u8>,
-        flushes: usize,
-        write_error: Option<io::ErrorKind>,
-        flush_error: Option<io::ErrorKind>,
-    }
-
-    impl Write for Writer {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            if let Some(kind) = self.write_error {
-                return Err(io::Error::from(kind));
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.flushes += 1;
-            match self.flush_error {
-                Some(kind) => Err(io::Error::from(kind)),
-                None => Ok(()),
-            }
-        }
-    }
-
-    #[test]
-    fn stdout_flattens_lines_preserves_text_and_flushes_each_record() {
-        let mut writer = Writer::default();
-        write_stdout_record(&mut writer, "[α\r\n] |  β \nnext").unwrap();
-        write_stdout_record(&mut writer, "").unwrap();
-        assert_eq!(writer.bytes, "[α] |  β next\n\n".as_bytes());
-        assert_eq!(writer.flushes, 2);
-    }
-
-    #[test]
-    fn stdout_propagates_write_and_flush_errors() {
-        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::PermissionDenied] {
-            let mut writer = Writer {
-                write_error: Some(kind),
-                ..Writer::default()
-            };
-            assert_eq!(
-                write_stdout_record(&mut writer, "bar").unwrap_err().kind(),
-                kind
-            );
-            assert_eq!(writer.flushes, 0);
-
-            let mut writer = Writer {
-                flush_error: Some(kind),
-                ..Writer::default()
-            };
-            assert_eq!(
-                write_stdout_record(&mut writer, "bar").unwrap_err().kind(),
-                kind
-            );
-            assert_eq!(writer.bytes, b"bar\n");
-        }
     }
 }

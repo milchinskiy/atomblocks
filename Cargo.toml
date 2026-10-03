@@ -1,6 +1,6 @@
 [package]
 name = "atomblocks"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license-file = "LICENSE"
 description = "async, absolutely lightweight and dead simple bar for dwm and similar window managers"
@@ -11,15 +11,16 @@ keywords = ["utils", "bar", "x11"]
 categories = ["command-line-utilities", "os"]
 
 [dependencies]
+argh = { version = "0.1" }
+libc = { version = "0.2" }
+log = { version = "0.4", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
 simple_logger = { version = "4", features = [
   "colored",
   "stderr",
 ], default-features = false }
-log = { version = "0.4", default-features = false }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
-serde = { version = "1", default-features = false }
 x11rb = { version = "0.13" }
-argh = { version = "0.1" }
 
 [profile.release]
 opt-level = "z"

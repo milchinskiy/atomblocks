@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [0.3.0] - 2026-10-03
+
+### Added
+
+* add optional per-block `timeout` and `output_limit` settings
+* add regression coverage for independent updates, manual-only intervals, command failures, output limits, and process cleanup
+* add GitHub Actions CI for the MSRV and current stable Rust
+
+### Changed
+
+* run blocks independently instead of waiting for an entire batch before publishing
+* use monotonic per-block deadlines and skip missed periodic ticks instead of replaying stale work
+* coalesce repeated manual hits while a block is running into one follow-up execution
+* make zero and omitted intervals manual-only, matching the documented configuration contract
+* run commands with null stdin and supervise each invocation as its own process group
+* bound captured command output to 64 KiB by default while continuing to drain pipes
+* report command failures with block context and bounded stderr without stopping unrelated blocks
+* search config locations in precedence order instead of selecting only the first environment-derived path
+* improve error messages and expose underlying errors through `std::error::Error::source`
+
+### Fixed
+
+* reject invalid, non-finite, negative, unrepresentable, and empty-command configuration before opening X11
+* prevent a slow or stuck block from delaying unrelated block updates
+* prevent timer work from accumulating in an unbounded catch-up queue
+* terminate and reap ordinary command process groups on SIGINT, SIGTERM, timeout, and fatal runtime failure
+* drain X11 hit queues larger than 1,024 IDs without leaving the tail permanently stuck
+* deduplicate non-adjacent hit IDs and process a pending hit queue at startup
+* treat X11 connection loss as fatal instead of retrying forever without a usable bar
+* check X11 subscription and WM_NAME protocol errors instead of discarding nested failures
+* keep blocked stdout consumers from stalling the coordinator or growing pending updates without bounds
+
+## [0.2.1] - 226-10-03
+
+### Added
+
+* add `--stdout` output while preserving X11-based manual updates
+
 ## [0.2.0] - 2024-02-12
 
 * move x11 stuff and timer for tasks into separate threads

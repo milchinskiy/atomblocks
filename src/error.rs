@@ -1,9 +1,19 @@
-use std::{fmt::Debug, sync::mpsc::SendError};
+use std::{fmt, path::PathBuf};
 
+#[derive(Debug)]
 pub enum AtomBlocksError {
     IOError(std::io::Error),
     Config(String),
-    SendReceived(SendError<(usize, String)>),
+    ConfigRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ConfigParse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    Runtime(String),
+    Interrupted(i32),
     X11Reply(x11rb::errors::ReplyError),
     X11Connect(x11rb::errors::ConnectError),
     X11Connection(x11rb::errors::ConnectionError),
@@ -11,14 +21,7 @@ pub enum AtomBlocksError {
 
 impl AtomBlocksError {
     pub fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::IOError(e) => Some(e),
-            Self::SendReceived(e) => Some(e),
-            Self::X11Reply(e) => Some(e),
-            Self::X11Connect(e) => Some(e),
-            Self::X11Connection(e) => Some(e),
-            Self::Config(_) => None,
-        }
+        std::error::Error::source(self)
     }
 }
 
@@ -31,12 +34,6 @@ impl From<std::io::Error> for AtomBlocksError {
 impl From<toml::de::Error> for AtomBlocksError {
     fn from(value: toml::de::Error) -> Self {
         Self::Config(value.to_string())
-    }
-}
-
-impl From<SendError<(usize, String)>> for AtomBlocksError {
-    fn from(value: SendError<(usize, String)>) -> Self {
-        Self::SendReceived(value)
     }
 }
 
@@ -58,30 +55,36 @@ impl From<x11rb::errors::ReplyError> for AtomBlocksError {
     }
 }
 
-impl Debug for AtomBlocksError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl std::error::Error for AtomBlocksError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::IOError(e) => Debug::fmt(&e, f),
-            Self::Config(e) => Debug::fmt(&e, f),
-            Self::X11Reply(e) => Debug::fmt(&e, f),
-            Self::X11Connect(e) => Debug::fmt(&e, f),
-            Self::X11Connection(e) => Debug::fmt(&e, f),
-            Self::SendReceived(e) => Debug::fmt(&e, f),
+            Self::IOError(error) => Some(error),
+            Self::ConfigRead { source, .. } => Some(source),
+            Self::ConfigParse { source, .. } => Some(source),
+            Self::X11Reply(error) => Some(error),
+            Self::X11Connect(error) => Some(error),
+            Self::X11Connection(error) => Some(error),
+            Self::Config(_) | Self::Runtime(_) | Self::Interrupted(_) => None,
         }
     }
 }
 
-impl std::error::Error for AtomBlocksError {}
-
-impl std::fmt::Display for AtomBlocksError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for AtomBlocksError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IOError(e) => Debug::fmt(&e, f),
-            Self::Config(e) => Debug::fmt(&e, f),
-            Self::X11Reply(e) => Debug::fmt(&e, f),
-            Self::X11Connect(e) => Debug::fmt(&e, f),
-            Self::X11Connection(e) => Debug::fmt(&e, f),
-            Self::SendReceived(e) => Debug::fmt(&e, f),
+            Self::IOError(error) => write!(f, "I/O error: {error}"),
+            Self::Config(error) => write!(f, "configuration error: {error}"),
+            Self::ConfigRead { path, source } => {
+                write!(f, "failed to read config {}: {source}", path.display())
+            }
+            Self::ConfigParse { path, source } => {
+                write!(f, "failed to parse config {}: {source}", path.display())
+            }
+            Self::Runtime(error) => f.write_str(error),
+            Self::Interrupted(signal) => write!(f, "terminated by signal {signal}"),
+            Self::X11Reply(error) => write!(f, "X11 reply error: {error}"),
+            Self::X11Connect(error) => write!(f, "X11 connection error: {error}"),
+            Self::X11Connection(error) => write!(f, "X11 connection error: {error}"),
         }
     }
 }
