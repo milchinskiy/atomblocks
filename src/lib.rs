@@ -1,5 +1,6 @@
 use config::Config;
 use std::{
+    io::{self, Write},
     process::{Child, Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -46,8 +47,16 @@ impl HitMan {
     }
 }
 
+/// Destination for bar updates. Both modes retain X11-based manual updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    X11,
+    Stdout,
+}
+
 pub struct AtomBlocks {
     config: Config,
+    output: OutputMode,
     cells: Vec<String>,
     xconn: Arc<x11rb::rust_connection::RustConnection>,
     root: u32,
@@ -56,6 +65,11 @@ pub struct AtomBlocks {
 
 impl AtomBlocks {
     pub fn new(config: Config) -> types::Result<Self> {
+        Self::new_with_output(config, OutputMode::X11)
+    }
+
+    /// Select the bar output destination; an X11 connection is still required.
+    pub fn new_with_output(config: Config, output: OutputMode) -> types::Result<Self> {
         let (xconn, root, atoms) = helpers::x11_connect()?;
         xconn.change_window_attributes(
             root,
@@ -68,12 +82,15 @@ impl AtomBlocks {
                 &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
             )
             .expect("ChangeWindowAttributesAux");
+        // Subscribe before waiting for hits, even when no WM_NAME write follows.
+        xconn.flush()?;
 
         let capacity = config.block.len();
         let cells = vec![String::new(); capacity];
         log::trace!("Allocated {} cells ({})", capacity, cells.len());
         Ok(Self {
             config,
+            output,
             cells,
             xconn: Arc::new(xconn),
             root,
@@ -195,22 +212,24 @@ impl AtomBlocks {
 
             if new_cells != self.cells {
                 self.cells = new_cells;
-                self.print();
+                self.print()?;
             }
         }
 
         Ok(())
     }
 
-    fn print(&self) {
-        log::info!("Updating WM_NAME property...");
-        let result = self.cells.iter().map(|c| c.to_string());
-        let delim = self.config.delimiter.clone().unwrap_or_default();
-        let result = result
-            .into_iter()
-            .filter(|r| !r.is_empty())
-            .collect::<Vec<_>>();
+    fn print(&self) -> types::Result<()> {
+        let result = render_bar(
+            &self.cells,
+            self.config.delimiter.as_deref().unwrap_or_default(),
+        );
+        if self.output == OutputMode::Stdout {
+            write_stdout_record(&mut io::stdout().lock(), &result)?;
+            return Ok(());
+        }
 
+        log::info!("Updating WM_NAME property...");
         if let Err(err) = self
             .xconn
             .change_property8(
@@ -218,16 +237,106 @@ impl AtomBlocks {
                 self.root,
                 AtomEnum::WM_NAME,
                 AtomEnum::STRING,
-                result.join(delim.as_str()).as_bytes(),
+                result.as_bytes(),
             )
             .map(|r| r.check())
         {
             log::error!("Failed to set WM_NAME property: {}", err);
         }
+        Ok(())
     }
 }
 
 pub struct Task {
     block: config::Block,
     last_run: Instant,
+}
+
+fn render_bar(cells: &[String], delimiter: &str) -> String {
+    cells
+        .iter()
+        .filter(|cell| !cell.is_empty())
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(delimiter)
+}
+
+fn write_stdout_record(writer: &mut impl Write, bar: &str) -> io::Result<()> {
+    // A bar update is one line, even when commands or decorations contain CR/LF.
+    writeln!(writer, "{}", bar.replace(['\r', '\n'], ""))?;
+    writer.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendering_preserves_x11_bytes_and_omits_empty_cells() {
+        let cells = vec![String::new(), "[α\n]".into(), String::new(), " β ".into()];
+        assert_eq!(render_bar(&cells, " | "), "[α\n] |  β ");
+        assert_eq!(render_bar(&cells, ""), "[α\n] β ");
+        assert_eq!(render_bar(&[], " | "), "");
+        assert_eq!(render_bar(&[String::new()], " | "), "");
+    }
+
+    #[derive(Default)]
+    struct Writer {
+        bytes: Vec<u8>,
+        flushes: usize,
+        write_error: Option<io::ErrorKind>,
+        flush_error: Option<io::ErrorKind>,
+    }
+
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(kind) = self.write_error {
+                return Err(io::Error::from(kind));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            match self.flush_error {
+                Some(kind) => Err(io::Error::from(kind)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn stdout_flattens_lines_preserves_text_and_flushes_each_record() {
+        let mut writer = Writer::default();
+        write_stdout_record(&mut writer, "[α\r\n] |  β \nnext").unwrap();
+        write_stdout_record(&mut writer, "").unwrap();
+        assert_eq!(writer.bytes, "[α] |  β next\n\n".as_bytes());
+        assert_eq!(writer.flushes, 2);
+    }
+
+    #[test]
+    fn stdout_propagates_write_and_flush_errors() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::PermissionDenied] {
+            let mut writer = Writer {
+                write_error: Some(kind),
+                ..Writer::default()
+            };
+            assert_eq!(
+                write_stdout_record(&mut writer, "bar").unwrap_err().kind(),
+                kind
+            );
+            assert_eq!(writer.flushes, 0);
+
+            let mut writer = Writer {
+                flush_error: Some(kind),
+                ..Writer::default()
+            };
+            assert_eq!(
+                write_stdout_record(&mut writer, "bar").unwrap_err().kind(),
+                kind
+            );
+            assert_eq!(writer.bytes, b"bar\n");
+        }
+    }
 }

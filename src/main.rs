@@ -3,14 +3,14 @@ use atomblocks::{
     config::Config,
     error::AtomBlocksError,
     types::Result,
-    AtomBlocks,
+    AtomBlocks, OutputMode,
 };
 use simple_logger::SimpleLogger;
-use std::path::PathBuf;
+use std::{io::ErrorKind, path::PathBuf, process::ExitCode};
 
 const CONFIG_FILE: &str = "config.toml";
 
-fn main() {
+fn main() -> ExitCode {
     let logger = SimpleLogger::new();
     let cli: AtomBlocksCli = argh::from_env();
 
@@ -26,7 +26,7 @@ fn main() {
 
     if cli.version() {
         println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-        return;
+        return ExitCode::SUCCESS;
     }
 
     let result = match cli.action() {
@@ -38,7 +38,12 @@ fn main() {
             };
             log::info!("Starting AtomBlocks");
             if let Ok(config_file) = config_file {
-                run(config_file)
+                let output = if params.stdout() {
+                    OutputMode::Stdout
+                } else {
+                    OutputMode::X11
+                };
+                run(config_file, output)
             } else {
                 Err(AtomBlocksError::Config("Failed to load config".into()))
             }
@@ -51,18 +56,21 @@ fn main() {
     };
 
     match result {
-        Ok(_) => (),
+        Ok(()) => ExitCode::SUCCESS,
+        Err(AtomBlocksError::IOError(err)) if err.kind() == ErrorKind::BrokenPipe => {
+            ExitCode::SUCCESS
+        }
         Err(err) => {
             log::error!("{}", err);
-            eprintln!("{}", err);
+            ExitCode::FAILURE
         }
     }
 }
 
-fn run(config: PathBuf) -> atomblocks::types::Result<()> {
+fn run(config: PathBuf, output: OutputMode) -> atomblocks::types::Result<()> {
     log::debug!("Starting AtomBlocks");
     Config::load_from_file(config)
-        .and_then(|config| AtomBlocks::new(config).and_then(|mut a| a.run()))
+        .and_then(|config| AtomBlocks::new_with_output(config, output).and_then(|mut a| a.run()))
 }
 
 fn hit(id: u32) -> atomblocks::types::Result<()> {

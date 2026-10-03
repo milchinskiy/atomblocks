@@ -91,6 +91,30 @@ There are a few places where configuration could live
 atomblocks run
 ```
 
+### Write bar updates to stdout
+
+```sh
+atomblocks run --stdout
+atomblocks run --stdout --config ./my-custom-config.toml | lemonbar
+atomblocks run --stdout --config ./my-custom-config.toml | dzen2
+```
+
+By default, AtomBlocks continues to update the X11 root window's `WM_NAME`.
+With `--stdout`, it writes the complete bar to standard output instead, only
+when block contents change. Each update ends with one newline and is flushed
+immediately. Carriage returns and newlines within the assembled bar are removed,
+so multiline command output is flattened. Block order, decorations, delimiters,
+and empty-block filtering are otherwise unchanged. No initial empty update is
+emitted. Bar-specific formatting belongs in your configuration.
+
+Both modes still require an X11 connection (`DISPLAY`), because manual updates
+via `atomblocks hit <ID>` use X11 properties. `--stdout` does not enable headless
+operation and does not update `WM_NAME`.
+
+Logs go to standard error, including with `--verbose` or `--trace`, keeping bar
+output clean. A closed output pipe ends the process successfully; other output
+errors are reported on standard error and produce a nonzero exit status.
+
 ### Manually hit the block to update
 
 ```sh
@@ -105,6 +129,22 @@ atomblocks run --config ./my-custom-config.toml
 ```
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
+
+## Tests
+
+```sh
+cargo test --locked
+```
+
+The process tests require an isolated X server. With Xvfb and `xvfb-run` installed:
+
+```sh
+xvfb-run -a cargo test --locked --test stdout -- --ignored --test-threads=1
+```
+
+These tests modify root-window properties; do not run them against your desktop
+X server. They are ignored by default, while CLI and output unit tests run
+without X11.
 
 <!-- CONTRIBUTING -->
 ## Contributing

@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "os"]
 [dependencies]
 simple_logger = { version = "4", features = [
   "colored",
+  "stderr",
 ], default-features = false }
 log = { version = "0.4", default-features = false }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
